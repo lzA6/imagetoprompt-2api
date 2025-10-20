@@ -1,0 +1,921 @@
+项目 'imagetoprompt-2api' 的结构树:
+📂 imagetoprompt-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 imagetoprompt_provider.py
+        📂 utils/
+            📄 sse_utils.py
+    📂 static/
+        📄 index.html
+        📄 script.js
+        📄 style.css
+================================================================================
+
+--- 文件路径: .env ---
+
+# [自动填充] imagetoprompt-2api 生产环境配置
+# 该文件由 Project Chimera 自动生成。
+
+# --- 安全配置 ---
+# 用于保护您的 API 服务的访问密钥，请按需修改为您自己的复杂密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# imagetoprompt-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-imagetoprompt-2api-default-key
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for imagetoprompt-2api (v1.0)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: imagetoprompt-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - imagetoprompt-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: imagetoprompt-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - imagetoprompt-net
+
+networks:
+  imagetoprompt-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import sys
+import re
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header, File, UploadFile, Form
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.imagetoprompt_provider import ImageToPromptProvider
+
+# --- 配置 Loguru ---
+logger.remove()
+logger.add(
+    sys.stdout,
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+           "<level>{level: <8}</level> | "
+           "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    colorize=True
+)
+
+# --- 全局 Provider 实例 ---
+provider = ImageToPromptProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    await provider.initialize()
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    logger.info(f"Web UI 测试界面已启用，请访问 http://localhost:{settings.NGINX_PORT}/")
+    yield
+    await provider.close()
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+# --- 挂载静态文件目录 ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --- 安全依赖 ---
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- API 路由 ---
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    """
+    兼容 Cherry Studio 等客户端的聊天接口。
+    它会从消息中提取图片 URL 或 Base64 Data URI，然后调用核心服务。
+    同时，它会从请求体中提取 'language' 和 'structured_prompt' 参数。
+    """
+    try:
+        request_data = await request.json()
+        messages = request_data.get("messages", [])
+        if not messages:
+            raise HTTPException(status_code=400, detail="请求体中缺少 'messages' 字段。")
+
+        # 提取语言和结构化提示参数，如果未提供则使用默认值
+        language = request_data.get("language", "en")
+        structured_prompt = request_data.get("structured_prompt", "yes")
+
+        # 查找最后一个用户消息中的图片信息
+        image_data_uri = None
+        url_pattern = re.compile(r'https?://[^\s\)]+')
+        data_uri_pattern = re.compile(r'data:image/[a-zA-Z]+;base64,[a-zA-Z0-9+/=]+')
+
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    # 尝试匹配 Data URI
+                    data_uri_match = data_uri_pattern.search(content)
+                    if data_uri_match:
+                        image_data_uri = data_uri_match.group(0)
+                        logger.info("从消息内容中提取到 Base64 Data URI。")
+                        break
+                    
+                    # 尝试匹配 URL
+                    url_match = url_pattern.search(content)
+                    if url_match:
+                        image_url = url_match.group(0)
+                        logger.info(f"从消息内容中提取到图片 URL: {image_url}")
+                        image_data_uri = await provider.url_to_data_uri(image_url)
+                        break
+        
+        if not image_data_uri:
+            raise HTTPException(status_code=400, detail="在用户消息中未找到有效的图片 URL 或 Base64 Data URI。")
+
+        return await provider.get_prompt_as_chat_completion(image_data_uri, language, structured_prompt)
+
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.post("/api/generate-from-upload", dependencies=[Depends(verify_api_key)])
+async def generate_from_upload(
+    image: UploadFile = File(...),
+    language: str = Form("en"),
+    structured_prompt: str = Form("yes")
+):
+    """
+    专为 Web UI 设计的接口，处理文件上传。
+    """
+    try:
+        image_bytes = await image.read()
+        import base64
+        mime_type = image.content_type
+        base64_data = base64.b64encode(image_bytes).decode('utf-8')
+        data_uri = f"data:{mime_type};base64,{base64_data}"
+        
+        prompt = await provider.get_prompt_internal(data_uri, language, structured_prompt)
+        return JSONResponse(content={"prompt": prompt})
+    except Exception as e:
+        logger.error(f"处理文件上传时发生错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+# --- Web UI 路由 ---
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_ui():
+    try:
+        with open("static/index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="UI 文件 (static/index.html) 未找到。")
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream imagetoprompt_backend {
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        client_max_body_size 2M; # 允许上传更大的图片文件
+
+        location / {
+            proxy_pass http://imagetoprompt_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+httpx
+aiohttp
+python-multipart
+loguru
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional, List, Dict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "imagetoprompt-2api"
+    APP_VERSION: str = "1.1.0" # 版本升级
+    DESCRIPTION: str = "一个将 imagetoprompt.app 转换为兼容 OpenAI 格式 API 的高性能代理，支持多语言和结构化提示。"
+
+    API_MASTER_KEY: Optional[str] = None
+    NGINX_PORT: int = 8088
+
+    API_REQUEST_TIMEOUT: int = 180
+
+    DEFAULT_MODEL: str = "image-to-prompt-v1"
+    KNOWN_MODELS: List[str] = ["image-to-prompt-v1"]
+
+    # 新增：支持的语言列表，键为显示名称，值为 API 参数
+    SUPPORTED_LANGUAGES: Dict[str, str] = {
+        "English": "en",
+        "Español": "es",
+        "Deutsch": "de",
+        "Français": "fr",
+        "Português": "pt",
+        "简体中文": "zh-CN",
+        "繁體中文": "zh-TW",
+        "العربية": "ar",
+        "Русский": "ru",
+        "日本語": "ja",
+        "한국어": "ko"
+    }
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def get_prompt_from_data_uri(self, data_uri: str) -> JSONResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\imagetoprompt_provider.py ---
+
+import time
+import uuid
+import mimetypes
+from typing import Dict, Any
+
+import httpx
+import aiohttp
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+from loguru import logger
+
+from app.core.config import settings
+
+class ImageToPromptProvider:
+    UPSTREAM_URL = "https://www.imagetoprompt.app/api/generate-prompt"
+
+    def __init__(self):
+        self.client: httpx.AsyncClient = None
+        self.session: aiohttp.ClientSession = None
+
+    async def initialize(self):
+        self.client = httpx.AsyncClient(timeout=settings.API_REQUEST_TIMEOUT)
+        self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        if self.client:
+            await self.client.aclose()
+        if self.session:
+            await self.session.close()
+
+    async def url_to_data_uri(self, url: str) -> str:
+        """从 URL 下载图片并转换为 Base64 Data URI"""
+        try:
+            async with self.session.get(url) as response:
+                response.raise_for_status()
+                image_bytes = await response.read()
+                mime_type = response.content_type or mimetypes.guess_type(url)[0] or "image/png"
+                
+                import base64
+                base64_data = base64.b64encode(image_bytes).decode('utf-8')
+                return f"data:{mime_type};base64,{base64_data}"
+        except Exception as e:
+            logger.error(f"下载或转换图片失败: {url}, 错误: {e}")
+            raise HTTPException(status_code=400, detail=f"无法从 URL 下载或处理图片: {e}")
+
+    async def get_prompt_internal(self, data_uri: str, language: str, structured_prompt: str) -> str:
+        """
+        核心内部函数，从 Data URI 获取提示词。
+        :param data_uri: 图片的 Base64 Data URI。
+        :param language: 目标语言代码 (例如 'en', 'zh-CN')。
+        :param structured_prompt: 是否使用结构化提示 ('yes' 或 'no')。
+        :return: 生成的提示词字符串。
+        """
+        headers = self._prepare_headers()
+        payload = {
+            "imageBase64": data_uri,
+            "language": language,
+            "structuredPrompt": structured_prompt
+        }
+
+        try:
+            logger.info(f"正在向上游 API 发送请求... 语言: {language}, 结构化: {structured_prompt}")
+            response = await self.client.post(self.UPSTREAM_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            
+            data = response.json()
+            if not data.get("success") or "prompt" not in data:
+                error_detail = data.get('prompt', '未知错误')
+                logger.error(f"上游 API 返回失败: {error_detail}")
+                raise HTTPException(status_code=502, detail=f"上游 API 返回失败: {error_detail}")
+
+            prompt = data["prompt"]
+            logger.success(f"成功获取提示词: {prompt[:100]}...")
+            return prompt
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"请求上游 API 失败，状态码: {e.response.status_code}, 响应: {e.response.text}")
+            raise HTTPException(status_code=502, detail=f"上游服务错误: {e.response.text}")
+        except Exception as e:
+            logger.error(f"处理请求时发生未知错误: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+    async def get_prompt_as_chat_completion(self, data_uri: str, language: str, structured_prompt: str) -> JSONResponse:
+        """为聊天端点调用核心函数并格式化为 OpenAI 响应。"""
+        prompt = await self.get_prompt_internal(data_uri, language, structured_prompt)
+        
+        chat_response = {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": settings.DEFAULT_MODEL,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": prompt,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+        }
+        return JSONResponse(content=chat_response)
+
+    def _prepare_headers(self) -> Dict[str, str]:
+        return {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Content-Type": "application/json",
+            "Origin": "https://www.imagetoprompt.app",
+            "Referer": "https://www.imagetoprompt.app/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        }
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+--- 文件路径: static\index.html ---
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ImageToPrompt-2API 测试面板 v1.1</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="left-panel">
+            <h1>ImageToPrompt-2API</h1>
+            <p>上传一张图片，AI 将为其生成详细的描述性提示词。</p>
+            
+            <div class="form-group">
+                <label for="api-key">API Key</label>
+                <input type="password" id="api-key" placeholder="请输入您的 API Key" value="1">
+            </div>
+
+            <div id="image-uploader" class="image-drop-zone">
+                <img id="image-preview" src="#" alt="图片预览" class="hidden">
+                <span id="upload-placeholder">点击或拖拽图片到此处</span>
+            </div>
+            <input type="file" id="image-upload-input" accept="image/*" class="hidden">
+
+            <div class="form-group">
+                <label for="language-select">提示词语言 (Prompt Language)</label>
+                <select id="language-select"></select>
+            </div>
+
+            <div class="form-group">
+                <label for="structured-prompt-select">结构化提示 (Structured Prompt)</label>
+                <select id="structured-prompt-select">
+                    <option value="yes" selected>是 (Yes)</option>
+                    <option value="no">否 (No)</option>
+                </select>
+            </div>
+
+            <button id="generate-btn">
+                <span id="btn-text">生成提示词</span>
+                <div id="btn-spinner" class="spinner-sm hidden"></div>
+            </button>
+        </div>
+        <div class="right-panel">
+            <div id="result-placeholder" class="placeholder">
+                <p>生成的提示词将显示在这里</p>
+            </div>
+            <div id="result-container" class="hidden">
+                <h3>生成的提示词:</h3>
+                <div id="prompt-output" class="prompt-box"></div>
+                <button id="copy-btn">复制</button>
+            </div>
+            <div id="error-message" class="error hidden"></div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
+
+--- 文件路径: static\script.js ---
+
+document.addEventListener('DOMContentLoaded', () => {
+    const apiKeyInput = document.getElementById('api-key');
+    const imageUploader = document.getElementById('image-uploader');
+    const imageUploadInput = document.getElementById('image-upload-input');
+    const imagePreview = document.getElementById('image-preview');
+    const uploadPlaceholder = document.getElementById('upload-placeholder');
+    const generateBtn = document.getElementById('generate-btn');
+    const btnText = document.getElementById('btn-text');
+    const btnSpinner = document.getElementById('btn-spinner');
+    const resultPlaceholder = document.getElementById('result-placeholder');
+    const resultContainer = document.getElementById('result-container');
+    const promptOutput = document.getElementById('prompt-output');
+    const copyBtn = document.getElementById('copy-btn');
+    const errorMessage = document.getElementById('error-message');
+    const languageSelect = document.getElementById('language-select');
+    const structuredPromptSelect = document.getElementById('structured-prompt-select');
+
+    let selectedFile = null;
+
+    // --- 语言选项 ---
+    const supportedLanguages = {
+        "English": "en", "Español": "es", "Deutsch": "de", "Français": "fr",
+        "Português": "pt", "简体中文": "zh-CN", "繁體中文": "zh-TW", "العربية": "ar",
+        "Русский": "ru", "日本語": "ja", "한국어": "ko"
+    };
+
+    // --- 初始化 ---
+    function initialize() {
+        // 填充语言下拉框
+        for (const [name, code] of Object.entries(supportedLanguages)) {
+            const option = document.createElement('option');
+            option.value = code;
+            option.textContent = name;
+            if (code === 'en') {
+                option.selected = true;
+            }
+            languageSelect.appendChild(option);
+        }
+    }
+
+    // --- 事件监听 ---
+    imageUploader.addEventListener('click', () => imageUploadInput.click());
+    imageUploader.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        imageUploader.classList.add('dragover');
+    });
+    imageUploader.addEventListener('dragleave', () => imageUploader.classList.remove('dragover'));
+    imageUploader.addEventListener('drop', (e) => {
+        e.preventDefault();
+        imageUploader.classList.remove('dragover');
+        const file = e.dataTransfer.files[0];
+        handleFile(file);
+    });
+    imageUploadInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
+    generateBtn.addEventListener('click', handleGenerate);
+    copyBtn.addEventListener('click', copyToClipboard);
+
+    // --- 核心函数 ---
+    function handleFile(file) {
+        if (!file || !file.type.startsWith('image/')) {
+            showError("请上传有效的图片文件。");
+            return;
+        }
+        selectedFile = file;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            imagePreview.src = e.target.result;
+            imagePreview.classList.remove('hidden');
+            uploadPlaceholder.classList.add('hidden');
+            hideError();
+        };
+        reader.readAsDataURL(file);
+    }
+
+    async function handleGenerate() {
+        const apiKey = apiKeyInput.value.trim();
+        if (!selectedFile) {
+            showError("请先上传一张图片。");
+            return;
+        }
+        if (!apiKey) {
+            showError("请输入 API Key。");
+            return;
+        }
+
+        setLoading(true);
+
+        const formData = new FormData();
+        formData.append('image', selectedFile);
+        formData.append('language', languageSelect.value);
+        formData.append('structured_prompt', structuredPromptSelect.value);
+
+        try {
+            const response = await fetch('/api/generate-from-upload', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                body: formData
+            });
+
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.detail || '生成失败，未知错误。');
+            }
+
+            displayResult(result.prompt);
+
+        } catch (error) {
+            showError(error.message);
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    function displayResult(prompt) {
+        resultPlaceholder.classList.add('hidden');
+        resultContainer.classList.remove('hidden');
+        promptOutput.textContent = prompt;
+    }
+
+    function copyToClipboard() {
+        navigator.clipboard.writeText(promptOutput.textContent).then(() => {
+            copyBtn.textContent = '已复制!';
+            setTimeout(() => { copyBtn.textContent = '复制'; }, 2000);
+        }).catch(err => {
+            showError('复制失败: ' + err);
+        });
+    }
+
+    // --- UI 状态辅助函数 ---
+    function setLoading(isLoading) {
+        generateBtn.disabled = isLoading;
+        btnText.style.display = isLoading ? 'none' : 'inline';
+        btnSpinner.classList.toggle('hidden', !isLoading);
+        if (isLoading) {
+            hideError();
+            resultContainer.classList.add('hidden');
+            resultPlaceholder.classList.remove('hidden');
+        }
+    }
+
+    function showError(message) {
+        errorMessage.textContent = message;
+        errorMessage.classList.remove('hidden');
+    }
+
+    function hideError() {
+        errorMessage.classList.add('hidden');
+    }
+
+    // --- 页面加载后执行 ---
+    initialize();
+});
+
+
+--- 文件路径: static\style.css ---
+
+:root {
+    --bg-color: #f7f8fa;
+    --panel-bg: #ffffff;
+    --border-color: #e5e7eb;
+    --text-primary: #1f2937;
+    --text-secondary: #6b7280;
+    --primary-color: #4f46e5;
+    --primary-hover: #4338ca;
+    --input-bg: #f9fafb;
+    --error-bg: #fee2e2;
+    --error-text: #b91c1c;
+    --error-border: #fca5a5;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    margin: 0;
+    background-color: var(--bg-color);
+    color: var(--text-primary);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    padding: 20px;
+}
+
+.container {
+    display: flex;
+    width: 100%;
+    max-width: 1000px;
+    height: 80vh;
+    min-height: 550px;
+    background-color: var(--panel-bg);
+    border-radius: 12px;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.05);
+    overflow: hidden;
+}
+
+.left-panel, .right-panel {
+    padding: 32px;
+    display: flex;
+    flex-direction: column;
+}
+
+.left-panel {
+    width: 45%;
+    border-right: 1px solid var(--border-color);
+    overflow-y: auto;
+}
+
+.right-panel {
+    width: 55%;
+    justify-content: center;
+    align-items: center;
+}
+
+h1 { margin: 0 0 8px 0; }
+.left-panel p { margin: 0 0 24px 0; color: var(--text-secondary); }
+
+.form-group { margin-bottom: 16px; }
+label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 14px; }
+input[type="password"], select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background-color: var(--input-bg);
+    font-size: 14px;
+}
+
+.image-drop-zone {
+    border: 2px dashed var(--border-color);
+    border-radius: 8px;
+    cursor: pointer;
+    height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+    background-color: var(--input-bg);
+    transition: border-color 0.2s;
+    margin-bottom: 16px;
+}
+.image-drop-zone.dragover { border-color: var(--primary-color); }
+#image-preview { max-width: 100%; max-height: 100%; object-fit: contain; }
+#upload-placeholder { color: var(--text-secondary); }
+
+#generate-btn {
+    width: 100%;
+    padding: 12px;
+    background-color: var(--primary-color);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-top: auto;
+}
+#generate-btn:hover { background-color: var(--primary-hover); }
+#generate-btn:disabled { background-color: #9ca3af; cursor: not-allowed; }
+
+.spinner-sm {
+    width: 20px;
+    height: 20px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    border-top-color: #fff;
+    animation: spin 1s ease-in-out infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.placeholder { text-align: center; color: var(--text-secondary); }
+.hidden { display: none; }
+
+#result-container { width: 100%; }
+.prompt-box {
+    background-color: var(--input-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 16px;
+    min-height: 100px;
+    max-height: 40vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    margin: 8px 0 16px 0;
+    line-height: 1.6;
+}
+#copy-btn {
+    padding: 8px 16px;
+    background-color: #e5e7eb;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+}
+#copy-btn:hover { background-color: #d1d5db; }
+
+.error {
+    color: var(--error-text);
+    background-color: var(--error-bg);
+    border: 1px solid var(--error-border);
+    padding: 12px;
+    border-radius: 6px;
+    text-align: center;
+    margin-top: 16px;
+}
+
+
+
