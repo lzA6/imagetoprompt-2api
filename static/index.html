@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ImageToPrompt-2API 测试面板 v1.1</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="left-panel">
+            <h1>ImageToPrompt-2API</h1>
+            <p>上传一张图片，AI 将为其生成详细的描述性提示词。</p>
+            
+            <div class="form-group">
+                <label for="api-key">API Key</label>
+                <input type="password" id="api-key" placeholder="请输入您的 API Key" value="1">
+            </div>
+
+            <div id="image-uploader" class="image-drop-zone">
+                <img id="image-preview" src="#" alt="图片预览" class="hidden">
+                <span id="upload-placeholder">点击或拖拽图片到此处</span>
+            </div>
+            <input type="file" id="image-upload-input" accept="image/*" class="hidden">
+
+            <div class="form-group">
+                <label for="language-select">提示词语言 (Prompt Language)</label>
+                <select id="language-select"></select>
+            </div>
+
+            <div class="form-group">
+                <label for="structured-prompt-select">结构化提示 (Structured Prompt)</label>
+                <select id="structured-prompt-select">
+                    <option value="yes" selected>是 (Yes)</option>
+                    <option value="no">否 (No)</option>
+                </select>
+            </div>
+
+            <button id="generate-btn">
+                <span id="btn-text">生成提示词</span>
+                <div id="btn-spinner" class="spinner-sm hidden"></div>
+            </button>
+        </div>
+        <div class="right-panel">
+            <div id="result-placeholder" class="placeholder">
+                <p>生成的提示词将显示在这里</p>
+            </div>
+            <div id="result-container" class="hidden">
+                <h3>生成的提示词:</h3>
+                <div id="prompt-output" class="prompt-box"></div>
+                <button id="copy-btn">复制</button>
+            </div>
+            <div id="error-message" class="error hidden"></div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
